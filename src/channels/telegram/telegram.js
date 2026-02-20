@@ -124,15 +124,13 @@ class TelegramChannel extends NotificationChannel {
         // Create session record
         await this._createSession(sessionId, notification, token);
 
-        // Generate Telegram message
-        const messageText = this._generateTelegramMessage(notification, sessionId, token);
-        
+        // Generate Telegram messages (may be multiple)
+        const messages = this._generateTelegramMessage(notification, sessionId, token);
+
         // Determine recipient (chat or group)
         const chatId = this.config.groupId || this.config.chatId;
-        const isGroupChat = !!this.config.groupId;
-        
+
         // Create buttons using callback_data instead of inline query
-        // This avoids the automatic @bot_name addition
         const buttons = [
             [
                 {
@@ -140,29 +138,41 @@ class TelegramChannel extends NotificationChannel {
                     callback_data: `personal:${token}`
                 },
                 {
-                    text: '👥 Group Chat', 
+                    text: '👥 Group Chat',
                     callback_data: `group:${token}`
                 }
             ]
         ];
-        
-        const requestData = {
-            chat_id: chatId,
-            text: messageText,
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: buttons
-            }
-        };
 
         try {
-            const response = await axios.post(
+            // Send first message with buttons
+            await axios.post(
                 `${this.apiBaseUrl}/bot${this.config.botToken}/sendMessage`,
-                requestData,
+                {
+                    chat_id: chatId,
+                    text: messages[0],
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: buttons
+                    }
+                },
                 this._getNetworkOptions()
             );
 
-            this.logger.info(`Telegram message sent successfully, Session: ${sessionId}`);
+            // Send remaining messages (Claude response chunks)
+            for (let i = 1; i < messages.length; i++) {
+                await axios.post(
+                    `${this.apiBaseUrl}/bot${this.config.botToken}/sendMessage`,
+                    {
+                        chat_id: chatId,
+                        text: messages[i],
+                        parse_mode: 'Markdown'
+                    },
+                    this._getNetworkOptions()
+                );
+            }
+
+            this.logger.info(`Telegram message sent successfully (${messages.length} parts), Session: ${sessionId}`);
             return true;
         } catch (error) {
             this.logger.error('Failed to send Telegram message:', error.response?.data || error.message);
@@ -176,34 +186,39 @@ class TelegramChannel extends NotificationChannel {
         const type = notification.type;
         const emoji = type === 'completed' ? '✅' : '⏳';
         const status = type === 'completed' ? 'Completed' : 'Waiting for Input';
-        
-        let messageText = `${emoji} *Claude Task ${status}*\n`;
-        messageText += `*Project:* ${notification.project}\n`;
-        messageText += `*Session Token:* \`${token}\`\n\n`;
-        
-        if (notification.metadata) {
-            if (notification.metadata.userQuestion) {
-                messageText += `📝 *Your Question:*\n${notification.metadata.userQuestion.substring(0, 200)}`;
-                if (notification.metadata.userQuestion.length > 200) {
-                    messageText += '...';
-                }
-                messageText += '\n\n';
-            }
-            
-            if (notification.metadata.claudeResponse) {
-                messageText += `🤖 *Claude Response:*\n${notification.metadata.claudeResponse.substring(0, 300)}`;
-                if (notification.metadata.claudeResponse.length > 300) {
-                    messageText += '...';
-                }
-                messageText += '\n\n';
+
+        // Return array of messages for multi-part sending
+        const messages = [];
+
+        // First message: header + question
+        let headerText = `${emoji} *Claude Task ${status}*\n`;
+        headerText += `*Project:* ${notification.project}\n`;
+        headerText += `*Session Token:* \`${token}\`\n\n`;
+
+        if (notification.metadata && notification.metadata.userQuestion) {
+            headerText += `📝 *Your Question:*\n${notification.metadata.userQuestion}\n\n`;
+        }
+
+        headerText += `💬 *To send a new command:*\n`;
+        headerText += `Reply with: \`/cmd ${token} <your command>\``;
+
+        messages.push(headerText);
+
+        // Additional messages: Claude response (split into 4000-char chunks)
+        if (notification.metadata && notification.metadata.claudeResponse) {
+            const response = notification.metadata.claudeResponse;
+            const chunkSize = 4000;
+
+            for (let i = 0; i < response.length; i += chunkSize) {
+                const chunk = response.substring(i, i + chunkSize);
+                const partLabel = response.length > chunkSize
+                    ? ` (${Math.floor(i / chunkSize) + 1}/${Math.ceil(response.length / chunkSize)})`
+                    : '';
+                messages.push(`🤖 *Claude Response${partLabel}:*\n${chunk}`);
             }
         }
-        
-        messageText += `💬 *To send a new command:*\n`;
-        messageText += `Reply with: \`/cmd ${token} <your command>\`\n`;
-        messageText += `Example: \`/cmd ${token} Please analyze this code\``;
 
-        return messageText;
+        return messages;
     }
 
     async _createSession(sessionId, notification, token) {
